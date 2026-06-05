@@ -4,6 +4,41 @@ import time
 
 from shell_builders import *
 
+# ============================================================
+# helper functions for comparison
+# ============================================================
+
+def shell_lists_equal(shell_a, shell_b, verbose=True):
+    """
+    Compare two shell_n_nodes lists, ignoring order inside each shell.
+    """
+
+    if len(shell_a) != len(shell_b):
+        if verbose:
+            print(f"Different number of nodes: {len(shell_a)} vs {len(shell_b)}")
+        return False
+
+    for i, (x, y) in enumerate(zip(shell_a, shell_b)):
+        x_sorted = np.sort(x)
+        y_sorted = np.sort(y)
+
+        if not np.array_equal(x_sorted, y_sorted):
+            if verbose:
+                print(f"\nMismatch at node {i}")
+                print("first :", x_sorted)
+                print("second:", y_sorted)
+            return False
+
+    return True
+
+
+def shell_size_summary(shells):
+    sizes = np.asarray([x.size for x in shells], dtype=np.int64)
+
+    print(f"mean shell size = {np.mean(sizes):.6f}")
+    print(f"min shell size  = {np.min(sizes)}")
+    print(f"max shell size  = {np.max(sizes)}")
+
 
 # ============================================================
 # choose graph
