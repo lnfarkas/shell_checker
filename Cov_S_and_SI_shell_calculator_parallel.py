@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 
 from loaders import *
-from X_and_SI_shell_builders import *
+from shell_covariance_parallel import *
 
 # ============================================================
 # choose graph
@@ -83,92 +83,113 @@ snapshot_states_list, snapshot_times, loaded_paths, skipped_paths = load_snapsho
     matched_curve_time=matched_curve_time,
 )
 
-# ============================================================
-# build X_i^(r) and ([SI]_{nth_i})^(r) matrices
-# ============================================================
-
-S_state = 0
-I_state = 1
-
-t3 = time.time()
-
-# Precompute, for every center node i, which graph edges touch shell_n_nodes[i]
-shell_edge_indices = build_shell_edge_indices(
+summary = summarize_covariance_parallel_streaming(
+    full_process_paths=full_process_paths,
+    matched_curve_time=matched_curve_time,
     N=N,
     v1=v1,
     v2=v2,
     shell_n_nodes=shell_n_nodes,
-    dtype=np.int32,
+    S_state=0,
+    I_state=1,
+    n_workers=8,
+    chunk_size=20,
 )
 
-N_loaded = len(snapshot_states_list)
+print_covariance_summary(summary)
 
-X_matrix = np.zeros((N_loaded, N), dtype=np.int8)
-SI_shell_matrix = np.zeros((N_loaded, N), dtype=np.int64)
-
-for r, snapshot_states in enumerate(snapshot_states_list):
-    X_row, SI_shell_row = compute_X_and_SI_shell_for_snapshot(
-        snapshot_states=snapshot_states,
-        v1=v1,
-        v2=v2,
-        shell_edge_indices=shell_edge_indices,
-        S_state=S_state,
-        I_state=I_state,
-        dtype_X=np.int8,
-        dtype_SI=np.int64,
-    )
-
-    X_matrix[r, :] = X_row
-    SI_shell_matrix[r, :] = SI_shell_row
-
-t4 = time.time()
-
-print("\nBuilt matrices")
-print("--------------")
-print("X_matrix.shape        =", X_matrix.shape)
-print("SI_shell_matrix.shape =", SI_shell_matrix.shape)
-print("matrix build time     =", t4 - t3, "seconds")
-
-# ============================================================
-# covariance summary
-# ============================================================
-
-summary = summarize_covariance_from_X_and_SI_shell(
-    X_matrix=X_matrix,
-    SI_shell_matrix=SI_shell_matrix,
+summary = summarize_covariance_parallel_streaming(
+    full_process_paths=full_process_paths,
+    matched_curve_time=matched_curve_time,
+    N=N,
+    v1=v1,
+    v2=v2,
+    shell_n_nodes=shell_n_nodes,
+    S_state=0,
+    I_state=1,
+    n_workers=8,
+    chunk_size=20,
 )
 
-print("\nCovariance summary")
-print("------------------")
-print("mean_S_SI_nth       =", summary["mean_S_SI_nth"])
-print("factorized          =", summary["factorized"])
-print("covariance          =", summary["covariance"])
-print("relative_covariance =", summary["relative_covariance"])
+print_covariance_summary(summary)
 
 # ============================================================
-# shell analyzis
+# shell analysis
 # ============================================================
 
-shell_sizes = np.asarray([x.size for x in shell_n_nodes], dtype=np.int64)
+shell_sizes = np.asarray(
+    [x.size for x in shell_n_nodes],
+    dtype=np.int64,
+)
 
-print("\nShell size diagnostics")
+print()
+print("Shell size diagnostics")
 print("----------------------")
 print("shell_n =", shell_n)
 print("number of centers with nonempty shell =", np.sum(shell_sizes > 0))
+print("fraction of centers with nonempty shell =", np.mean(shell_sizes > 0))
 print("mean shell size =", np.mean(shell_sizes))
+print("std shell size  =", np.std(shell_sizes))
 print("min shell size  =", np.min(shell_sizes))
 print("max shell size  =", np.max(shell_sizes))
 print("total shell nodes counted over centers =", np.sum(shell_sizes))
 
+if np.sum(shell_sizes > 0) > 0:
+    print("mean shell size among nonempty shells =", np.mean(shell_sizes[shell_sizes > 0]))
+else:
+    print("mean shell size among nonempty shells = nan")
+
+
 # ============================================================
-# shell-edge analyzis (how many edges are in the shell)
+# shell-edge analysis
 # ============================================================
 
-shell_edge_sizes = np.asarray([x.size for x in shell_edge_indices], dtype=np.int64)
+offsets = summary["offsets"]
 
-print("\nShell-edge diagnostics (how many _any_ edges are in the shell)")
+shell_edge_sizes = offsets[1:] - offsets[:-1]
+
+print()
+print("Shell-edge diagnostics")
 print("----------------------")
+print("number of centers with nonempty shell-edge set =", np.sum(shell_edge_sizes > 0))
+print("fraction of centers with nonempty shell-edge set =", np.mean(shell_edge_sizes > 0))
 print("mean shell-edge count =", np.mean(shell_edge_sizes))
+print("std shell-edge count  =", np.std(shell_edge_sizes))
 print("min shell-edge count  =", np.min(shell_edge_sizes))
 print("max shell-edge count  =", np.max(shell_edge_sizes))
 print("total shell edges counted over centers =", np.sum(shell_edge_sizes))
+
+if np.sum(shell_edge_sizes > 0) > 0:
+    print(
+        "mean shell-edge count among nonempty shell-edge sets =",
+        np.mean(shell_edge_sizes[shell_edge_sizes > 0]),
+    )
+else:
+    print("mean shell-edge count among nonempty shell-edge sets = nan")
+
+
+# ============================================================
+# edge density around shell
+# ============================================================
+
+shell_edge_per_shell_node = np.full(
+    shell_sizes.shape,
+    np.nan,
+    dtype=np.float64,
+)
+
+nonempty_shell = shell_sizes > 0
+
+shell_edge_per_shell_node[nonempty_shell] = (
+    shell_edge_sizes[nonempty_shell]
+    /
+    shell_sizes[nonempty_shell]
+)
+
+print()
+print("Shell-edge per shell-node diagnostics")
+print("-------------------------------------")
+print("mean shell-edge / shell-node =", np.nanmean(shell_edge_per_shell_node))
+print("std shell-edge / shell-node  =", np.nanstd(shell_edge_per_shell_node))
+print("min shell-edge / shell-node  =", np.nanmin(shell_edge_per_shell_node))
+print("max shell-edge / shell-node  =", np.nanmax(shell_edge_per_shell_node))
