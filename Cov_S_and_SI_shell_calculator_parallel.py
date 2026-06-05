@@ -20,7 +20,7 @@ graphs_dir = base_dir / "Graphs"
 INSTANCE_NUMBER = 0
 INSTANCE_TAG = f"instanceNo{INSTANCE_NUMBER:04d}"
 
-shell_n = 4
+shell_n = 2
 
 
 # ============================================================
