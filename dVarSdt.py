@@ -3,6 +3,8 @@ from pathlib import Path
 import time
 import matplotlib.pyplot as plt
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from loaders import *
 from shell_covariance_parallel import *
 
@@ -23,9 +25,21 @@ INSTANCE_TAG = f"instanceNo{INSTANCE_NUMBER:04d}"
 
 beta = 1.0
 
-t_start = time.time()
+full_process_dir = base_dir / "FullProcess"
+curves_dir = base_dir / "Curves"
+
+N_processes = 1000
+approx_time = 0.3
+
+S_state = 0
+I_state = 1
+
+n_workers = 8
+
+t_total_start = time.time()
+
 # ============================================================
-# find and load graph file
+# load graph
 # ============================================================
 
 graph_path, N, v1, v2 = load_graph_file(
@@ -33,15 +47,9 @@ graph_path, N, v1, v2 = load_graph_file(
     instance_tag=INSTANCE_TAG,
 )
 
-# ==============================================================
-# load full simulations and curves
-#===============================================================
-
-full_process_dir = base_dir / "FullProcess"
-curves_dir = base_dir / "Curves"
-
-N_processes = 1000
-approx_time = 0.3
+# ============================================================
+# find full process paths and load curve file
+# ============================================================
 
 full_process_paths = find_full_process_paths(
     full_process_dir=full_process_dir,
@@ -56,141 +64,182 @@ curve_path, curve_idx, matched_curve_time, curve_data = load_curve_and_match_tim
     approx_time=approx_time,
 )
 
-snapshot_states_list, snapshot_times, loaded_paths, skipped_paths = load_snapshots_at_or_before_time(
-    full_process_paths=full_process_paths,
-    matched_curve_time=matched_curve_time,
-)
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# ============================================================
-# Parallel compute dVar(S)/dt from snapshots for every curve-file time
-#
-# dVar(S)/dt = beta <[SI]> - 2 beta Cov(S, [SI])
-# Cov(S,[SI]) = <S[SI]> - <S><[SI]>
-# ============================================================
-
-S_state = 0
-I_state = 1
-
 time_grid = curve_data["time_grid"]
+T = len(time_grid)
 
-dVarS_dt_snapshot_all = np.zeros_like(time_grid, dtype=np.float64)
-mean_S_all = np.zeros_like(time_grid, dtype=np.float64)
-mean_SI_all = np.zeros_like(time_grid, dtype=np.float64)
-mean_S_SI_all = np.zeros_like(time_grid, dtype=np.float64)
-cov_S_SI_all = np.zeros_like(time_grid, dtype=np.float64)
-var_S_snapshot_all = np.zeros_like(time_grid, dtype=np.float64)
-n_loaded_all = np.zeros_like(time_grid, dtype=np.int64)
-n_skipped_all = np.zeros_like(time_grid, dtype=np.int64)
+print()
+print("Loaded setup")
+print("------------")
+print("simID =", simID)
+print("N =", N)
+print("number of full process files =", len(full_process_paths))
+print("number of curve times =", T)
+print("curve_path =", curve_path)
 
 
-def compute_one_time(tidx):
-    t = time_grid[tidx]
+# ============================================================
+# helper: load one full-process file
+# ============================================================
 
-    snapshot_states_list, snapshot_times, loaded_paths, skipped_paths = load_snapshots_at_or_before_time(
-        full_process_paths=full_process_paths,
-        matched_curve_time=t,
-    )
+def load_full_process_file(path):
+    """
+    Loads one full-process .npz file.
 
-    S_counts = np.array(
-        [
-            np.sum(states == S_state)
-            for states in snapshot_states_list
-        ],
-        dtype=np.float64,
-    )
+    Your files use:
+        raw_times
+        raw_vertex_states
+    """
 
-    SI_counts = np.array(
-        [
-            np.sum(
-                (
-                    (states[v1] == S_state)
-                    & (states[v2] == I_state)
-                )
-                |
-                (
-                    (states[v1] == I_state)
-                    & (states[v2] == S_state)
-                )
+    d = np.load(path, allow_pickle=True)
+
+    times = np.asarray(d["raw_times"], dtype=np.float64)
+    states_all = np.asarray(d["raw_vertex_states"])
+
+    # Make sure shape is (n_times, N)
+    if states_all.ndim != 2:
+        raise ValueError(
+            f"raw_vertex_states should be 2D, but got shape {states_all.shape} in {path}"
+        )
+
+    if states_all.shape[0] != len(times) and states_all.shape[1] == len(times):
+        states_all = states_all.T
+
+    if states_all.shape[0] != len(times):
+        raise ValueError(
+            f"State/time shape mismatch in {path}: "
+            f"states shape = {states_all.shape}, len(times) = {len(times)}"
+        )
+
+    return times, states_all
+
+
+# ============================================================
+# helper: compute all curve times for one realization
+# ============================================================
+
+def compute_one_realization(path):
+    times, states_all = load_full_process_file(path)
+
+    local_sum_S = np.zeros(T, dtype=np.float64)
+    local_sum_S2 = np.zeros(T, dtype=np.float64)
+    local_sum_SI = np.zeros(T, dtype=np.float64)
+    local_sum_S_SI = np.zeros(T, dtype=np.float64)
+    local_n = np.zeros(T, dtype=np.int64)
+
+    # For each curve time, use latest snapshot at or before that time
+    snapshot_indices = np.searchsorted(times, time_grid, side="right") - 1
+
+    for tidx, snap_idx in enumerate(snapshot_indices):
+        if snap_idx < 0:
+            continue
+
+        states = states_all[snap_idx]
+
+        S_count = np.sum(states == S_state)
+
+        SI_count = np.sum(
+            (
+                (states[v1] == S_state)
+                & (states[v2] == I_state)
             )
-            for states in snapshot_states_list
-        ],
-        dtype=np.float64,
-    )
+            |
+            (
+                (states[v1] == I_state)
+                & (states[v2] == S_state)
+            )
+        )
 
-    mean_S = np.mean(S_counts)
-    mean_SI = np.mean(SI_counts)
-    mean_S_SI = np.mean(S_counts * SI_counts)
+        local_sum_S[tidx] = S_count
+        local_sum_S2[tidx] = S_count**2
+        local_sum_SI[tidx] = SI_count
+        local_sum_S_SI[tidx] = S_count * SI_count
+        local_n[tidx] = 1
 
-    cov_S_SI = mean_S_SI - mean_S * mean_SI
-
-    dVarS_dt_snapshot = (
-        beta * mean_SI
-        - 2.0 * beta * cov_S_SI
-    )
-
-    var_S_snapshot = np.var(S_counts)
-
-    return {
-        "tidx": tidx,
-        "t": t,
-        "mean_S": mean_S,
-        "mean_SI": mean_SI,
-        "mean_S_SI": mean_S_SI,
-        "cov_S_SI": cov_S_SI,
-        "dVarS_dt_snapshot": dVarS_dt_snapshot,
-        "var_S_snapshot": var_S_snapshot,
-        "n_loaded": len(loaded_paths),
-        "n_skipped": len(skipped_paths),
-    }
+    return local_sum_S, local_sum_S2, local_sum_SI, local_sum_S_SI, local_n
 
 
-n_workers = 15
+# ============================================================
+# compute sums in parallel over realizations
+# ============================================================
 
-t_start = time.time()
+sum_S = np.zeros(T, dtype=np.float64)
+sum_S2 = np.zeros(T, dtype=np.float64)
+sum_SI = np.zeros(T, dtype=np.float64)
+sum_S_SI = np.zeros(T, dtype=np.float64)
+n_loaded_all = np.zeros(T, dtype=np.int64)
+
+t_compute_start = time.time()
 
 with ThreadPoolExecutor(max_workers=n_workers) as executor:
     futures = [
-        executor.submit(compute_one_time, tidx)
-        for tidx in range(len(time_grid))
+        executor.submit(compute_one_realization, path)
+        for path in full_process_paths
     ]
 
     for done_idx, future in enumerate(as_completed(futures), start=1):
-        out = future.result()
+        local_sum_S, local_sum_S2, local_sum_SI, local_sum_S_SI, local_n = future.result()
 
-        tidx = out["tidx"]
+        sum_S += local_sum_S
+        sum_S2 += local_sum_S2
+        sum_SI += local_sum_SI
+        sum_S_SI += local_sum_S_SI
+        n_loaded_all += local_n
 
-        mean_S_all[tidx] = out["mean_S"]
-        mean_SI_all[tidx] = out["mean_SI"]
-        mean_S_SI_all[tidx] = out["mean_S_SI"]
-        cov_S_SI_all[tidx] = out["cov_S_SI"]
-        dVarS_dt_snapshot_all[tidx] = out["dVarS_dt_snapshot"]
-        var_S_snapshot_all[tidx] = out["var_S_snapshot"]
-        n_loaded_all[tidx] = out["n_loaded"]
-        n_skipped_all[tidx] = out["n_skipped"]
+        if done_idx % 50 == 0 or done_idx == len(full_process_paths):
+            print(f"Finished {done_idx}/{len(full_process_paths)} realizations")
 
-        # print(
-        #     f"Finished {done_idx}/{len(time_grid)} "
-        #     f"(tidx={tidx}, t={out['t']}, loaded={out['n_loaded']}, skipped={out['n_skipped']})"
-        # )
-
-t_end = time.time()
+t_compute_end = time.time()
 
 print()
-print("Finished computing dVar(S)/dt from snapshots for all times.")
-print("Total time =", t_end - t_start, "seconds")
+print("Finished computing snapshot averages.")
+print("Computation time =", t_compute_end - t_compute_start, "seconds")
+print("Computation time =", (t_compute_end - t_compute_start) / 60, "minutes")
 
 # ============================================================
-# Compare snapshot formula with numerical derivative from curve file
+# convert sums to averages
+# ============================================================
+
+valid = n_loaded_all > 0
+
+mean_S_all = np.full(T, np.nan, dtype=np.float64)
+mean_S2_all = np.full(T, np.nan, dtype=np.float64)
+mean_SI_all = np.full(T, np.nan, dtype=np.float64)
+mean_S_SI_all = np.full(T, np.nan, dtype=np.float64)
+
+mean_S_all[valid] = sum_S[valid] / n_loaded_all[valid]
+mean_S2_all[valid] = sum_S2[valid] / n_loaded_all[valid]
+mean_SI_all[valid] = sum_SI[valid] / n_loaded_all[valid]
+mean_S_SI_all[valid] = sum_S_SI[valid] / n_loaded_all[valid]
+
+var_S_snapshot_all = mean_S2_all - mean_S_all**2
+cov_S_SI_all = mean_S_SI_all - mean_S_all * mean_SI_all
+
+dVarS_dt_snapshot_all = (
+    beta * mean_SI_all
+    - 2.0 * beta * cov_S_SI_all
+)
+
+print()
+print("Loaded realizations per time")
+print("----------------------------")
+print("min =", np.min(n_loaded_all))
+print("max =", np.max(n_loaded_all))
+print("expected =", len(full_process_paths))
+
+# ============================================================
+# curve-file variance and numerical derivative
 # ============================================================
 
 var_S_curve_all = curve_data["var_fractions"][:, 0] * N**2
 
 dVarS_dt_curve_all = np.gradient(
-    var_S_curve_all,
+    var_S_curve_all*(N-1)/N,
     time_grid
 )
+
+# ============================================================
+# plot derivative comparison
+# ============================================================
 
 plt.figure(figsize=(8, 5))
 
@@ -220,7 +269,7 @@ plt.tight_layout()
 plt.show()
 
 # ============================================================
-# Integral of dVar(S)/dt from snapshot formula
+# integrate covariance formula
 # ============================================================
 
 integral_dVarS_dt_snapshot = np.zeros_like(dVarS_dt_snapshot_all)
@@ -236,17 +285,13 @@ integral_dVarS_dt_snapshot[1:] = np.cumsum(
     * dt
 )
 
-# Use initial snapshot variance as initial condition
 var_S_integrated_from_snapshot_formula = (
     var_S_snapshot_all[0]
     + integral_dVarS_dt_snapshot
 )
 
-
 # ============================================================
-# Save Var(S) from integrated covariance formula
-# This is the exact curve plotted as:
-# var_S_integrated_from_snapshot_formula
+# save exact integrated covariance-formula curve
 # ============================================================
 
 save_dir = base_dir / "IntegratedCovarianceFormula"
@@ -271,30 +316,35 @@ np.savez_compressed(
     # time grid
     time_grid=time_grid,
 
-    # the actual plotted integrated covariance-formula curve
+    # exact integrated covariance-formula curve
     var_S_integrated_from_snapshot_formula=var_S_integrated_from_snapshot_formula,
 
-    # ingredients used to construct it
+    # ingredients
     dVarS_dt_snapshot_all=dVarS_dt_snapshot_all,
     cov_S_SI_all=cov_S_SI_all,
     mean_SI_all=mean_SI_all,
     mean_S_all=mean_S_all,
+    mean_S2_all=mean_S2_all,
     mean_S_SI_all=mean_S_SI_all,
 
-    # initial condition used
+    # initial condition
     var_S_initial=var_S_snapshot_all[0],
 
-    # optional comparison curves
+    # comparison curves
     var_S_snapshot_all=var_S_snapshot_all,
     var_S_curve_all=var_S_curve_all,
+
+    # diagnostics
+    n_loaded_all=n_loaded_all,
 )
 
 print()
 print("Saved integrated covariance-formula Var(S) curve to:")
 print(save_path)
 
-# Curve-file variance
-var_S_curve_all = curve_data["var_fractions"][:, 0] * N**2
+# ============================================================
+# plot integrated variance
+# ============================================================
 
 plt.figure(figsize=(8, 5))
 
@@ -310,12 +360,12 @@ plt.plot(
     var_S_integrated_from_snapshot_formula,
     linestyle="--",
     linewidth=2,
-    label=r"$\mathrm{Var}(S)(0)+\int_0^t d\mathrm{Var}(S)/dt\,du$ from snapshot formula",
+    label=r"$\mathrm{Var}(S)(0)+\int_0^t d\mathrm{Var}(S)/dt\,du$ from covariance formula",
 )
 
 plt.plot(
     time_grid,
-    var_S_curve_all,
+    var_S_curve_all*(N-1)/N,
     linestyle=":",
     linewidth=2,
     label=r"$\mathrm{Var}(S)$ from curve file",
@@ -323,13 +373,57 @@ plt.plot(
 
 plt.xlabel(r"$t$")
 plt.ylabel(r"$\mathrm{Var}(S)$")
-plt.title(r"Integrated snapshot formula for $\mathrm{Var}(S)(t)$")
+plt.title(r"Integrated covariance formula for $\mathrm{Var}(S)(t)$")
 plt.legend(fontsize=8)
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-t_end = time.time()
+# ============================================================
+# error plot
+# ============================================================
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    time_grid,
+    var_S_integrated_from_snapshot_formula - var_S_snapshot_all,
+    linewidth=2,
+    label=r"integrated covariance formula $-$ snapshot variance",
+)
+
+plt.plot(
+    time_grid,
+    var_S_integrated_from_snapshot_formula - var_S_curve_all*(N-1)/N,
+    linestyle="--",
+    linewidth=2,
+    label=r"integrated covariance formula $-$ curve-file variance",
+)
+
+plt.plot(
+    time_grid,
+    var_S_snapshot_all - var_S_curve_all*(N-1)/N,
+    linestyle="--",
+    linewidth=2,
+    label=r"snapshot variance $-$ curve-file variance",
+)
+
+plt.axhline(0.0, color="black", linewidth=1, linestyle=":")
+
+plt.xlabel(r"$t$")
+plt.ylabel(r"error")
+plt.title(r"Error of integrated covariance formula")
+plt.legend(fontsize=8)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# total time
+# ============================================================
+
+t_total_end = time.time()
 
 print()
-print("Total execution time:", (t_end - t_start) / 60, "minutes")
+print("Total execution time:", t_total_end - t_total_start, "seconds")
+print("Total execution time:", (t_total_end - t_total_start) / 60, "minutes")
